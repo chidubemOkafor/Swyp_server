@@ -4,7 +4,15 @@ import { Types } from "mongoose"
 import { Chat as ChatModel } from "../../models/chat.model"
 import { dateToLocalTime } from "../../utils/localtime"
 
-export async function getMeetingPeers(meetingId: string, userId: string) {
+export interface peerType {
+    username: string | undefined;
+    role: string;
+    userId: Types.ObjectId;
+    isYou: boolean;
+}
+export async function getMeetingPeers(meetingId: string, userId: string): Promise<peerType[] | {
+    message: string;
+}> {
     try {
         console.log(meetingId)
         const meeting = await MeetingModel.findOne({meetingId})
