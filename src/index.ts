@@ -14,8 +14,6 @@ httpServer.listen(port, () => {
     logger.info(`Server running on port: ${port}`);
 });
 
-
-
 process.on("SIGINT", () => {
     console.log("Shutting down server...");
     httpServer.close(() => {

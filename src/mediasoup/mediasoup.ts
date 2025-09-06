@@ -22,8 +22,9 @@ export const createWorker = async() => {
 export const createWebRtcTransport = async (callback: any, router: Router<AppData>, sender: boolean) => {
     try {
         const webRtcTransport_options: WebRtcTransportOptions = {
-            listenIps: [ {
-                ip: '127.0.0.1'
+            listenIps: [{
+                ip: process.env.MEDIASOUP_LISTEN_IP || '127.0.0.1',
+                announcedIp: process.env.MEDIASOUP_ANNOUNCED_IP || undefined,
             }],
             enableUdp: true,
             enableTcp: true,

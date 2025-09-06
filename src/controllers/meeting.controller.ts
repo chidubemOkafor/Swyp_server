@@ -4,7 +4,7 @@ import { body_guard } from "../middlewares/body_guard.middleware";
 
 const router = Router()
 
-router.post("/create",body_guard, (req: Request, res: Response) => {
+router.post("/create", body_guard, (req: Request, res: Response) => {
     const meeting = new Meeting(req, res);
     meeting.create();
   });

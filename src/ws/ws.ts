@@ -7,14 +7,43 @@ import dotenv from "dotenv";
 import { verifyJwt } from '../utils/jwt';
 import { exitMeeting, getAllMessages, getMeetingPeers, joinMeeting, peerType } from '../services/meeting/meeting.function';
 import { createWebRtcTransport, createWorker } from '../mediasoup/mediasoup';
-import { mediaCodecs } from '../utils/mediaCodecs.';
+import { mediaCodecs } from '../utils/mediaCodecs';
 import { WebRtcTransport } from 'mediasoup/node/lib/WebRtcTransportTypes';
-import { AppData, Consumer, Producer } from 'mediasoup/node/lib/types';
+import { AppData, Consumer, Producer, Router, Worker } from 'mediasoup/node/lib/types';
+import { transport } from 'pino';
+import mongoose from 'mongoose';
 dotenv.config()
 
+let worker: Worker
+let router: Router
 
+const setupMediasoup = async () => {
+    worker = await createWorker();
+    router = await worker.createRouter({ mediaCodecs });
+};
 
+interface PeerInfo {
+  producerTransport?: WebRtcTransport<AppData>;
+  consumerTransport?: WebRtcTransport<AppData>;
+  producers: Map<string, Producer<AppData>>; // key: kind or label
+  consumers: Map<string, Consumer<AppData>>; // key: producerId
+}
+
+const peers = new Map<string, PeerInfo>();
+
+const fetchPeer = (userId: string, callback: any): PeerInfo => {
+    const peer = peers.get(userId);
+    if (!peer) {
+        callback({ error: 'peer not joined' });
+        throw new Error("Peer not joined");
+    }
+    return peer;
+};
+
+setupMediasoup();
 io.use((socket, next) => {
+    if (mongoose.connection.readyState !== 1) return;
+
     const token = socket.handshake.auth.token;
     const meetingId = socket.handshake.query.meetingId as string
     if (!token) {
@@ -45,14 +74,16 @@ io.on('connection', async(socket:Socket) => {
     const meetingId = socket.user?.meetingId as string
     const username = socket.user?.username as string
 
-    // mediasoup
-    let producerTransport: WebRtcTransport<AppData> | undefined;
-    let consumerTransport: WebRtcTransport<AppData> | undefined
-    let producer: Producer<AppData> | undefined
-    let consumer: Consumer<AppData> | undefined
+    peers.set(userId, {
+        producerTransport: undefined,
+        consumerTransport: undefined,
+        producers: new Map(),
+        consumers: new Map()
+    });
 
     // meeting
     socket.on("join-meeting", async () => {
+       
         await joinMeeting(meetingId, userId);
         
         socket.join(meetingId)
@@ -68,10 +99,6 @@ io.on('connection', async(socket:Socket) => {
         });
     });
 
-
-    const worker =  await createWorker()
-    const router = await worker.createRouter({ mediaCodecs })
-
     socket.on('getRtpCapabilities', (callback) => {
         const rtpCapabilities = router.rtpCapabilities
         console.log("router rtp capabilities", rtpCapabilities)
@@ -79,88 +106,119 @@ io.on('connection', async(socket:Socket) => {
     })
 
     socket.on('createWebRtcTransport', async({ sender }, callback) => {
+        const peer = fetchPeer(userId, callback)
         if(sender){
-            producerTransport = await createWebRtcTransport(callback, router, sender)
+            peer.producerTransport = await createWebRtcTransport(callback, router, sender)
         } else {
-            consumerTransport = await createWebRtcTransport(callback, router, sender)
+            peer.consumerTransport = await createWebRtcTransport(callback, router, sender)
         }
-
     })
 
-    socket.on('transport-connect', async({ transportId, dtlsParameters }) => {
-        console.log('transportID...', { transportId })
+    socket.on('transport-connect', async({ dtlsParameters }, callback) => {
+        const peer = fetchPeer(userId, callback)
         console.log('DTLS PARAMS...', { dtlsParameters })
-        await producerTransport?.connect({ dtlsParameters })
+        await peer.producerTransport?.connect({ dtlsParameters })
     })
 
-    socket.on('transport-produce', async({ 
-        transportId,
+    socket.on('transport-produce', async({
         kind,
         rtpParameters,
         appData,
     }, callback) => {
-        producer = await producerTransport?.produce({
-            kind,
-            rtpParameters
-        })
-
-        console.log('Producer ID: ', producer?.id, producer?.kind)
+        const peer = fetchPeer(userId, callback)
+        const newProducer = await peer.producerTransport?.produce({ kind, rtpParameters });
+        if (!newProducer) return
+        peer.producers.set(newProducer.kind, newProducer);
         
-        producer?.on('transportclose', () => {
+        console.log('Producer ID: ', newProducer!.id, newProducer.kind)
+        
+        newProducer.on('transportclose', () => {
             console.log('transport for this producer closed')
-            producer?.close()
+            newProducer.close()
         })
 
         callback({
-            id: producer?.id
+            id: newProducer.id
         })
+
+        console.log('1')
+
+        socket.to(meetingId).emit('new-producer', {
+            userId,
+            username,
+            kind: newProducer.kind,
+            producerId: newProducer.id
+        });
+
+        console.log('2')
+
+        console.log("producers has been created successfully")
     })
 
-    socket.on('transport-recv-connect', async ({ dtlsParameters }) => {
+    socket.on('transport-recv-connect', async ({ dtlsParameters }, callback) => {
+        const peer = fetchPeer(userId, callback)
         console.log(`DTLS PARAMS: ${dtlsParameters}`)
-        await consumerTransport?.connect({ dtlsParameters })
+        console.log("consumeers22")
+        await peer.consumerTransport?.connect({ dtlsParameters })
     })
 
-    socket.on('consume', async({ rtpCapabilities }, callback) => {
+    socket.on('consume', async ({ rtpCapabilities }, callback) => {
         try {
-            if(router.canConsume({
-                producerId: producer?.id as string,
-                rtpCapabilities
-            })) {
-                consumer = await consumerTransport?.consume({
-                    producerId: producer?.id as string,
-                    rtpCapabilities,
-                    paused: true
-                })
-
-                consumer?.on('transportclose', () => {
-                    console.log('transport closed from consumer')
-                })
-
-                consumer?.on('@producerclose', () => {
-                    console.log('producer of consumer closed')
-                })
-
-                const params = {
-                    id: consumer?.id,
-                    producerId: producer?.id,
-                    kind: consumer?.kind,
-                    rtpParameters: consumer?.rtpParameters
-                }
-
-                callback({params})
+            const peer = fetchPeer(userId, callback);
+            if (!peer.consumerTransport) {
+                return callback({ error: 'No consumer transport' });
             }
-        } catch (error: any) {
-            console.log(error.message)
-            callback({
-                params: {
-                error: error
-                }
-            })
-        }
-    })
+            const consumers: any[] = [];
 
-    socket.on('consumer-resume', async () => {
+            for (const [peerId, remotePeer] of peers.entries()) {
+                if (peerId === userId) continue;
+
+                for (const producer of remotePeer.producers.values()) {
+                    if (!router.canConsume({ producerId: producer.id, rtpCapabilities })) {
+                        console.warn(`Cannot consume producer ${producer.id}`);
+                        continue;
+                    }
+
+                    const consumer = await peer.consumerTransport!.consume({
+                        producerId: producer.id,
+                        rtpCapabilities,
+                        paused: false
+                    });
+
+                    peer.consumers.set(producer.id, consumer);
+
+                    // Cleanup
+                    consumer.on('transportclose', () => {
+                        peer.consumers.delete(producer.id);
+                    });
+
+                    consumer.on('@producerclose', () => {
+                        peer.consumers.delete(producer.id);
+                    });
+
+                    consumers.push({
+                        id: consumer.id,
+                        producerId: producer.id,
+                        kind: consumer.kind,
+                        rtpParameters: consumer.rtpParameters
+                    });
+                }
+            }
+
+            if (consumers.length === 0) {
+                return callback({ error: 'No available producers to consume' });
+            }
+
+            callback({ consumers });
+        } catch (err: any) {
+            console.error(err);
+            callback({ error: err.message });
+        }
+    });
+
+    socket.on('consumer-resume', async ({producerId}, callback) => {
+        const peer = fetchPeer(userId, callback)
+        const consumer = peer.consumers.get(producerId)
         console.log('consumer-resumed')
         await consumer?.resume()
     })
@@ -272,25 +330,6 @@ io.on('connection', async(socket:Socket) => {
             username
         })
     })
-
-    // //signalling
-    // socket.on("webrtc:signal", (value) => {
-    //     if (value.offer) {
-    //         console.log("value",value)
-    //         socket.to(meetingId).emit("webrtc:offer", value)
-    //     } 
-
-    //     if (value.answer) {
-    //         console.log("answer",value)
-    //         socket.to(meetingId).emit("webrtc:answer", value)
-    //     }
-    //     if (value["new-ice-candidate"]) {
-    //         console.log(value)
-    //         socket.to(meetingId).emit("webrtc:ice-candidate", {
-    //             iceCandidate: value["new-ice-candidate"]
-    //         })
-    //     }
-    // })
     
     socket.on('disconnect', async() => {
         logger.info(`{peer: ${socket.id}, username: ${username}} disconnected`)

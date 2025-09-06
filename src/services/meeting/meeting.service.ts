@@ -1,41 +1,97 @@
-import { v4 as uuid } from "uuid";
 import createError from "http-errors";
 import { Request, Response } from "express";
-import { IMeeting, Meeting as MeetingModel } from "../../models/meeting.models";
+import { IMeeting, Meeting as MeetingModel, MeetingType } from "../../models/meeting.models";
 import { User } from "../../types/user/user";
 import { Types } from "mongoose";
 import { User as UserModel } from "../../models/auth.models";
 import logger from "../../utils/logger";
+import { generateMeetingId } from "../../utils/generateMeetingId";
+import { create_, InstantMeeting, ScheduledMeeting } from "../../dtos/meeting";
 
 export class Meeting {
     constructor(private readonly req: Request, private readonly res: Response) {}
 
     async create() {
-        const user = this.req.user;
-        const { title, displayName } = this.req.body;
-    
-        if (!user) {
-            return this.res
-                .status(new createError.NotAcceptable().statusCode)
-                .json({ message: "User is not in the token" });
-        }
-    
+        const { isSheduledMeeting } = create_.parse(this.req.body)
         try {
-    
-            const newMeeting = new MeetingModel({
-                title,
-                displayName: displayName || user.username,
-                creator: user.userId,
-                meetingId: uuid(),
-            });
-    
-            const savedMeeting = await newMeeting.save();
-    
-            return this.res.status(201).json(savedMeeting);
+            isSheduledMeeting ? this.createScheduledMeeting() : this.createInstantMeeting()
         } catch (error) {
             return this.res
                 .status(new createError.InternalServerError().statusCode)
                 .json({ message: "Something went wrong", error });
+        }
+    }
+
+    async createInstantMeeting() {
+        const user = this.isUser() as User
+        const { title, description } = InstantMeeting.parse(this.req.body)
+
+        const meetingOption: Partial<IMeeting> = {
+            creator: new Types.ObjectId(user.userId),
+            title,
+            description,
+            type: MeetingType.open,
+            scheduledStartTime: new Date(),
+            meetingId: generateMeetingId()
+        }
+
+        const newMeeting = new MeetingModel(meetingOption);
+
+        try {
+            const savedMeeting = await newMeeting.save();
+            return this.res.status(201).json(savedMeeting);
+
+        } catch (error) {
+            throw error
+        }
+    }
+
+    async createScheduledMeeting() {
+        const user = this.isUser() as User
+        const { title, description, scheduledStartTime, duration, type, scheduledParticipants } = ScheduledMeeting.parse(this.req.body);
+
+        let meetingOption: Partial<IMeeting> = {
+            creator: new Types.ObjectId(user.userId),
+            title,
+            description,
+            type,
+            duration,
+            scheduledStartTime,
+            meetingId: generateMeetingId()
+        }
+
+        if (type === "closed"){
+            if(!scheduledParticipants) {
+                return this.res
+                    .status(new createError.NotAcceptable().statusCode)
+                    .json({ message: "You need participants in a closed meeting"})
+            }
+            meetingOption.scheduledParticipants = [...this.parseStringIdToObjectId(scheduledParticipants), new Types.ObjectId(user.userId)]
+        } 
+
+        const newMeeting = new MeetingModel(meetingOption)
+
+        try {
+            const savedMeeting = await newMeeting.save();
+            return this.res.status(201).json(savedMeeting);
+
+        } catch (error) {
+            throw error
+        }
+    }
+
+    private parseStringIdToObjectId(userIds: string[]) {
+        return userIds.map((userId) => new Types.ObjectId(userId))
+    }
+
+    private isUser() {
+        const { user } = this.req
+        if (!user) {
+            return this.res
+                .status(new createError.NotAcceptable().statusCode)
+                .json({ message: "User is not in the token" });
+        } else {
+            return user
         }
     }
 
